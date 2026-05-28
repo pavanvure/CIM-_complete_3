@@ -338,19 +338,26 @@ public class StreamingMilsoftCsvParser {
         String rowId   = idIdx   >= 0 && idIdx   < values.size() ? values.get(idIdx).trim()   : String.valueOf(lineNum);
         String rowName = nameIdx >= 0 && nameIdx < values.size() ? values.get(nameIdx).trim() : "";
 
-        // Determine CIM type
-        String cimType = SECTION_TO_CIM.getOrDefault(section, "milsoft:" + section);
+        // Determine CIM type.  cimType is fixed at construction time on
+        // CIMObject (no setter), so for SWITCH sections we must resolve the
+        // refined type (Breaker/Disconnector/Fuse/…) from the Type column
+        // BEFORE constructing the object — see resolveCimType().
+        String cimType = resolveCimType(section, headers, values, colMapping);
 
-        CIMObject obj = new CIMObject();
-        obj.setRdfId("_milsoft_" + section.toLowerCase() + "_" + rowId);
-        obj.setMrid(obj.getRdfId());
-        obj.setName(rowName);
-        obj.setCimType(cimType);
+        String rdfId = "_milsoft_" + section.toLowerCase() + "_" + rowId;
+
+        // Construct via the real API: (cimType, rdfId).  This also seeds mrid
+        // = rdfId inside the constructor.
+        CIMObject obj = new CIMObject(cimType, rdfId);
         obj.setSourceFile(fileName);
         obj.setSourceFormat("MILSOFT_CSV");
 
-        Map<String, String> attributes = new LinkedHashMap<>();
-        Map<String, String> references = new LinkedHashMap<>();
+        // Name flows through setAttribute("IdentifiedObject.name", …) — the
+        // CIMObject derives getName()/mrid from known attribute keys.  Set it
+        // explicitly only when we actually have a name value.
+        if (!rowName.isEmpty()) {
+            obj.setAttribute("IdentifiedObject.name", rowName);
+        }
 
         // Process each column
         for (int i = 0; i < headers.size() && i < values.size(); i++) {
@@ -359,41 +366,72 @@ public class StreamingMilsoftCsvParser {
 
             if (value.isEmpty()) continue;
 
+            // ID and NAME are already consumed above — don't also dump them
+            // into the milsoft: bucket.
+            if ("ID".equals(colUpper) || "NAME".equals(colUpper)) continue;
+
             // Look up CIM mapping for this column
             String cimAttr = colMapping.get(colUpper);
 
             if (cimAttr == null) {
                 // No explicit mapping — store as milsoft: vendor attribute
-                attributes.put("milsoft:" + colUpper.toLowerCase(), value);
+                obj.setAttribute("milsoft:" + colUpper.toLowerCase(), value);
                 continue;
             }
 
             if (cimAttr.startsWith("ref:")) {
-                // Reference attribute — store in references map
+                // Reference attribute — store via addReference
                 String refKey = cimAttr.substring(4);
-                // Milsoft IDs → generate rdfId
-                references.put(refKey, "_milsoft_node_" + value);
+                // Milsoft IDs → generate rdfId for the referenced node
+                obj.addReference(refKey, "_milsoft_node_" + value);
 
             } else if (cimAttr.equals("milsoft:switchType")) {
-                // Refine the switch cimType based on Type column
-                String refined = SWITCH_TYPE_MAP.get(value.toUpperCase());
-                if (refined != null) obj.setCimType(refined);
-                attributes.put(cimAttr, value);
+                // cimType already resolved before construction — just record
+                // the raw value as an attribute for traceability.
+                obj.setAttribute(cimAttr, value);
 
             } else if (cimAttr.equals("Switch.normalOpen")) {
                 // Normalise: 0/false → "false", 1/true → "true"
                 String normalized = ("1".equals(value) || "true".equalsIgnoreCase(value))
                         ? "true" : "false";
-                attributes.put(cimAttr, normalized);
+                obj.setAttribute(cimAttr, normalized);
 
             } else {
-                attributes.put(cimAttr, value);
+                obj.setAttribute(cimAttr, value);
             }
         }
 
-        obj.setAttributes(attributes);
-        obj.setReferences(references);
         return obj;
+    }
+
+    /**
+     * Resolve the final CIM type for a row.
+     *
+     * For most sections this is just the SECTION_TO_CIM lookup.  For SWITCH
+     * sections, the concrete type (Breaker / Disconnector / Fuse / Recloser /
+     * …) depends on the row's "Type" column, which must be read here because
+     * CIMObject fixes cimType at construction.
+     */
+    private String resolveCimType(String section, List<String> headers,
+                                   List<String> values,
+                                   Map<String, String> colMapping) {
+        String base = SECTION_TO_CIM.getOrDefault(section, "milsoft:" + section);
+
+        // Only SWITCH rows carry a refining Type column.
+        if (!"SWITCH".equals(section)) return base;
+
+        // Find which header maps to milsoft:switchType, then read that value.
+        for (int i = 0; i < headers.size() && i < values.size(); i++) {
+            String colUpper = headers.get(i).toUpperCase();
+            String mapped   = colMapping.get(colUpper);
+            if ("milsoft:switchType".equals(mapped)) {
+                String typeVal = values.get(i).trim();
+                String refined = SWITCH_TYPE_MAP.get(typeVal.toUpperCase());
+                if (refined != null) return refined;
+                break;
+            }
+        }
+        return base;
     }
 
     // ── Column header parsing ─────────────────────────────────────────────
