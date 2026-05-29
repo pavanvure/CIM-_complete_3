@@ -25,6 +25,7 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
 import java.io.*;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.*;
 import java.security.MessageDigest;
 import java.time.Instant;
@@ -51,6 +52,8 @@ public class ImportService {
     @Value("${cim.upload.temp-dir:/tmp/cim-uploads}") private String tempDir;
 
     private final StreamingRdfXmlParser      rdfParser;
+    private final com.cim.streaming.StreamingMilsoftCsvParser milsoftParser;
+    private final com.cim.streaming.StreamingMilsoftStdParser  stdParser;
     private final com.cim.streaming.StreamingJsonLdParser jsonLdParser;
     private final StreamingReferenceResolver refResolver;
     private final CimObjectRecordRepository  objectRepo;
@@ -65,6 +68,7 @@ public class ImportService {
 
     public ImportService(StreamingRdfXmlParser rdfParser,
                           com.cim.streaming.StreamingMilsoftCsvParser milsoftParser,
+                          com.cim.streaming.StreamingMilsoftStdParser stdParser,
                           com.cim.streaming.StreamingJsonLdParser jsonLdParser,
                           StreamingReferenceResolver refResolver,
                           CimObjectRecordRepository objectRepo,
@@ -76,6 +80,7 @@ public class ImportService {
                           Neo4jExportConfigRepository exportConfigRepo) {
         this.rdfParser          = rdfParser;
         this.milsoftParser      = milsoftParser;
+        this.stdParser          = stdParser;
         this.jsonLdParser       = jsonLdParser;
         this.refResolver        = refResolver;
         this.objectRepo         = objectRepo;
@@ -233,12 +238,27 @@ public class ImportService {
 
         try (InputStream fis = Files.newInputStream(tmp)) {
             // Dispatch on format string set by ImportController (FormatDetector).
-            // All three parsers honour the same onObject Consumer contract, so
-            // the per-object handling above stays format-agnostic.
+            // All parsers honour the same onObject Consumer contract, so the
+            // per-object handling above stays format-agnostic.
             String fmt = format == null ? "" : format.toUpperCase().trim();
             switch (fmt) {
                 case "MILSOFT_CSV":
-                    milsoftParser.stream(fis, fileName, onObject);
+                case "MILSOFT":
+                case "MILSOFT_STD":
+                    // Two Milsoft dialects share the MILSOFT_CSV format tag:
+                    //   • Real WindMil ".STD" export — banner "MILSOFT STD WM ASCII",
+                    //     positional columns (Id,Type,Phase,Parent,...).
+                    //   • INI-style sectioned CSV — [Line]/[Switch] headers.
+                    // Peek the first line to pick the right parser.  We read the
+                    // banner from the temp file directly so the parser still gets
+                    // a fresh stream positioned at the top.
+                    if (com.cim.streaming.StreamingMilsoftStdParser.looksLikeStd(peekFirstLine(tmp))) {
+                        log.info("Milsoft dialect = .STD (WindMil) for job={}", jobId);
+                        stdParser.stream(fis, fileName, onObject);
+                    } else {
+                        log.info("Milsoft dialect = INI-style sectioned CSV for job={}", jobId);
+                        milsoftParser.stream(fis, fileName, onObject);
+                    }
                     break;
                 case "JSON_LD":
                 case "JSONLD":
@@ -349,6 +369,23 @@ public class ImportService {
 
         r.setCreatedAt(Instant.now());
         return r;
+    }
+
+    // ── Peek first line of the temp file (for Milsoft dialect detection) ──
+    //
+    // Reads only the first non-empty line without consuming the stream the
+    // parser will use (parser gets its own fresh InputStream).  Returns ""
+    // on any error so detection falls back to the INI parser.
+    private String peekFirstLine(Path tmp) {
+        try (BufferedReader r = Files.newBufferedReader(tmp, StandardCharsets.UTF_8)) {
+            String line;
+            while ((line = r.readLine()) != null) {
+                if (!line.trim().isEmpty()) return line;
+            }
+        } catch (Exception e) {
+            log.warn("peekFirstLine failed for {}: {}", tmp, e.getMessage());
+        }
+        return "";
     }
 
     // ── REQ #5: estimate object count for accurate percentSaved ──────────
